@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+    alertmanager_detail_exporter
+
+    Export Prometheus Alertmanager alerts as metrics for consumption back into Prometheus
+
+    Prometheus has the synthentic ALERTS timeseries, but that doesn't indicate what's
+    suppressed, silenced, etc., since that is handled by the Alertmanager.
+
+    Main use case is a Grafana dashboard using the worldmap panel - I want to just show
+    active alerts and group them by the 'location' label I include.
+
+    Not using the Prometheus python client since it doesn't want do do a variable number
+    of labels for the same timeseries.
+
+    Pass 'filter' to filter the alerts, using the same '<label>="<value>"' syntax as Alertmanager
+
+    TODO: just limit it to a whitelist of lables?
+"""
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+import requests
+import urllib.parse
+import sys
+import argparse
+
+__version__ = "0.7.2"
+
+ENDPOINT = 'http://localhost:9093/api/v2/alerts'
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    pass
+
+class AlertmanagerDetailCollector(BaseHTTPRequestHandler):
+
+    def _set_headers(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain; version=0.0.4')
+        self.end_headers()
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        self._set_headers()
+
+        if url.path == "/alerts_detail" or url.path == "/alert_detail":
+            params = urllib.parse.parse_qs(url.query)
+            try:
+                alert_filter = params["filter"][0]
+                uri = ENDPOINT + "?filter=%s" % alert_filter
+            except KeyError:
+                uri = ENDPOINT
+
+            self.wfile.write("# HELP ALERTS_DETAIL detailed alert info from Alertmanager\n# TYPE ALERTS_DETAIL gauge\n")
+
+            response = requests.get(uri).json()
+
+            for alert in response:
+                state = alert['status']['state']
+                silenced = 'true' if len(alert['status']['silencedBy']) > 0 else 'false'
+                inhibited = 'true' if len(alert['status']['inhibitedBy']) > 0 else 'false'
+
+                receivers = "|".join(sorted([r['name'] for r in alert['receivers']]))
+
+                self.wfile.write('ALERTS_DETAIL{')
+                self.wfile.write(','.join(['{}="{}"'.format(k, v)
+                                        for k, v in sorted(alert['labels'].items())]))
+                self.wfile.write(',alert_state="%s",alert_silenced="%s",alert_inhibited="%s",alert_receivers="%s"} 1\n' % (state, silenced, inhibited, receivers))
+        else:
+            self.wfile.write("alertmanager_detail_exporter v{0}\n\nCall /alerts_detail for detailed alert info\n".format(__version__))
+
+
+def run():
+    server = ThreadedHTTPServer(('localhost', args.port), AlertmanagerDetailCollector)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        usage=__doc__.replace(r"%", r"%%"),
+        description="Prometheus Alertmanager detail exporter",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    parser.add_argument(
+        "-p",
+        "--port",
+        dest="port",
+        type=int,
+        default=9334,
+        help="HTTP port to listen to",
+    )
+
+    parser.add_argument("--version", action="version", version=__version__)
+
+    try:
+        args = parser.parse_args()
+        run()
+    except KeyboardInterrupt:
+        print(" Interrupted")
+        sys.exit(0)
